@@ -1,23 +1,18 @@
 #!/usr/bin/env bash
 # ccswitch installer
-#   curl -fsSL https://raw.githubusercontent.com/2hmad/ccswitch/main/install.sh | bash
+# Local-only installer. No network or update fallback.
 set -euo pipefail
 
-REPO="${CCSWITCH_REPO:-2hmad/ccswitch}"
-REF="${CCSWITCH_REF:-main}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
-URL="https://raw.githubusercontent.com/$REPO/$REF/bin/ccswitch"
+SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required"; exit 1; }
 
 mkdir -p "$PREFIX"
 
-if [ -f "./bin/ccswitch" ]; then
-  install -m 755 ./bin/ccswitch "$PREFIX/ccswitch"      # local checkout
-else
-  curl -fsSL "$URL" -o "$PREFIX/ccswitch"
-  chmod 755 "$PREFIX/ccswitch"
-fi
+[ -f "$SOURCE_DIR/bin/ccswitch" ] || { echo "local source is missing; refusing to download anything" >&2; exit 1; }
+bash -n "$SOURCE_DIR/bin/ccswitch"
+install -m 755 "$SOURCE_DIR/bin/ccswitch" "$PREFIX/ccswitch"
 
 echo "installed -> $PREFIX/ccswitch"
 

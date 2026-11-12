@@ -310,18 +310,6 @@ check "targeted save stores into the named slot" \
   "$(python3 -c "import json,os;print(json.load(open(os.environ['CCSWITCH_HOME']+'/accounts/beta/credentials.json'))['claudeAiOauth']['accessToken'])")" \
   "TOK-B10"
 
-# Version comparison must be numeric, not lexical: "0.10.0" is newer than
-# "0.9.0" but sorts before it as a string.
-sed -n '/^version_gt()/,/^}/p' "$ROOT/bin/ccswitch" > "$TMP/version-functions.sh"
-# shellcheck source=/dev/null
-source "$TMP/version-functions.sh"
-vg() { if version_gt "$1" "$2"; then echo yes; else echo no; fi; }
-check "version_gt 0.10.0 > 0.9.0"  "$(vg 0.10.0 0.9.0)"  "yes"
-check "version_gt 0.9.0 !> 0.10.0" "$(vg 0.9.0 0.10.0)"  "no"
-check "version_gt equal is false"  "$(vg 0.5.0 0.5.0)"   "no"
-check "version_gt 1.0.0 > 0.99.9"  "$(vg 1.0.0 0.99.9)"  "yes"
-check "version_gt handles shorts"  "$(vg 0.5.1 0.5)"     "yes"
-
 # Being signed out must not trap you on the dead account. capture_into refuses
 # a cleared credential by design, but that refusal must not abort the switch -
 # switching away is exactly what you need when a session has died.
@@ -436,22 +424,10 @@ use_out="$(ccswitch use delta --force 2>&1)"
 check "use: lapsed access token not called expired" "$(grep -c expired <<<"$use_out" || true)" "0"
 check "use: reports re-login days" "$(grep -c 're-login in 2[78]d' <<<"$use_out" || true)" "1"
 
-# An npm copy updates through npm, against the npm registry - not GitHub, whose
-# latest tag may be a release npm never received.
-NPMROOT="$TMP/npmglobal"
-mkdir -p "$NPMROOT/lib/node_modules/@2hmad/ccswitch/bin" "$NPMROOT/bin" "$TMP/reg/@2hmad/ccswitch" "$TMP/stub"
-cp "$ROOT/bin/ccswitch" "$NPMROOT/lib/node_modules/@2hmad/ccswitch/bin/ccswitch"
-ln -s ../lib/node_modules/@2hmad/ccswitch/bin/ccswitch "$NPMROOT/bin/ccswitch"
-echo '{"version":"99.0.0"}' > "$TMP/reg/@2hmad/ccswitch/latest"
-printf '#!/bin/sh\necho "$@" > "%s/npm-args"\n' "$TMP" > "$TMP/stub/npm"
-chmod +x "$TMP/stub/npm"
-npm_run() { PATH="$NPMROOT/bin:$TMP/stub:$PATH" CCSWITCH_NPM_REGISTRY="file://$TMP/reg" ccswitch "$@" 2>&1; }
-check "update: npm copy checks the registry" "$(npm_run update --check | grep -c 'latest:  99.0.0')" "1"
-npm_run update >/dev/null || true
-check "update: npm copy runs npm install" "$(cat "$TMP/npm-args" 2>/dev/null)" "install -g --prefer-online @2hmad/ccswitch@99.0.0"
-echo '{"version":"0.0.1"}' > "$TMP/reg/@2hmad/ccswitch/latest"
-rm -f "$TMP/npm-args"
-check "update: npm copy up to date skips npm" "$(npm_run update | grep -c 'already up to date')$(test -e "$TMP/npm-args" && echo ran)" "1"
+# Software updates are deliberately unavailable in this fork.
+must_fail "update disabled" ccswitch update
+must_fail "upgrade disabled" ccswitch upgrade
+must_fail "update check disabled" ccswitch update --check
 
 # A claude session left open as another account keeps renewing that account's
 # token and writes it over the live credential, whichever account is live. Each

@@ -10,8 +10,9 @@
 # MIT licensed.
 
 set -euo pipefail
+umask 077
 
-VERSION="0.9.1"
+VERSION="0.9.1-local.1"
 
 # --- locations --------------------------------------------------------------
 if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
@@ -58,7 +59,7 @@ kc_account() {
   local u="${USER:-}"
   [ -n "$u" ] || u="$(id -un 2>/dev/null || true)"
   case "$u" in
-    ""|*[!a-zA-Z0-9._-]*) u="claude-code-user" ;;
+    ""|.|..|*[!a-zA-Z0-9._-]*) u="claude-code-user" ;;
   esac
   printf '%s' "$u"
 }
@@ -161,7 +162,7 @@ t = json.load(open(tp)) if os.path.exists(tp) else {}
 i = json.load(open(ip)) if os.path.exists(ip) else {}
 for k in $IDENTITY_KEYS:
     t.pop(k, None)
-t.update(i)
+t.update({k: i[k] for k in $IDENTITY_KEYS if k in i})
 os.makedirs(os.path.dirname(tp) or ".", exist_ok=True)
 json.dump(t, open(tp, "w"), indent=2)
 PYEOF
@@ -255,12 +256,13 @@ fmt_days() {  # $1=seconds, "none" or "dead"
 
 # --- state ------------------------------------------------------------------
 active_name() { if [ -f "$ACTIVE_FILE" ]; then cat "$ACTIVE_FILE"; fi; }
-acct_exists() { [ -d "$ACCOUNTS/$1" ]; }
+acct_exists() { validate_name "$1"; [ ! -L "$ACCOUNTS/$1" ] && [ -d "$ACCOUNTS/$1" ]; }
 
 validate_name() {
   case "$1" in
-    ""|*[!a-zA-Z0-9._-]*) die "invalid account name '$1' (use letters, digits, . _ -)" ;;
+    ""|.|..|*[!a-zA-Z0-9._-]*) die "invalid account name '$1' (use letters, digits, . _ -)" ;;
   esac
+  [ ! -L "$ACCOUNTS/$1" ] || die "symlinked account directories are forbidden"
 }
 
 # True only when an interactive Claude Code session is running. Several
@@ -411,6 +413,7 @@ PYEOF
 
 # Snapshot the live credential+identity into an account slot.
 capture_into() {  # $1=account name
+  validate_name "$1"
   local n="$1" d="$ACCOUNTS/$1"
   cred_exists || die "no live credential found - run 'claude' and /login first"
 
@@ -444,6 +447,7 @@ capture_into() {  # $1=account name
 
 # Restore an account slot into the live location.
 restore_from() {  # $1=account name
+  validate_name "$1"
   local n="$1" d="$ACCOUNTS/$1"
   [ -f "$d/credentials.json" ] || die "account '$n' has no stored credential"
   cred_install "$d/credentials.json" "$n"
@@ -750,7 +754,6 @@ cmd_list() {
   done
   [ "$found" = 1 ] || info "${DIM}no accounts yet - run: ccswitch login <name>${RST}"
   warn_if_shared
-  update_notice
 }
 
 cmd_current() {
@@ -889,10 +892,6 @@ cmd_refresh() {
       todo+=("$n")
     fi
   done
-  # The scheduled refresh is the natural place to do the network check, so
-  # 'list' can show the notice without ever reaching out itself.
-  update_check >/dev/null 2>&1 || true
-
   [ "${#todo[@]}" -gt 0 ] || return 0
 
   command -v claude >/dev/null 2>&1 || die "the 'claude' command was not found on PATH"
@@ -1119,8 +1118,34 @@ cmd_mcp() {
 
 cmd_backup() {
   local out="${1:-$HOME/ccswitch-backup-$(date +%F-%H%M).tar.gz}"
-  tar czf "$out" -C "$(dirname "$VAULT")" "$(basename "$VAULT")"
-  chmod 600 "$out"
+  python3 - "$VAULT" "$out" <<'PYEOF'
+import os, pathlib, stat, sys, tarfile, tempfile
+vault, out = map(lambda p: pathlib.Path(os.path.abspath(p)), sys.argv[1:])
+tmp = None
+try:
+    if vault.is_symlink() or out.is_symlink():
+        raise ValueError("symlinks are not allowed")
+    if out.resolve() == vault.resolve() or vault.resolve() in out.resolve().parents:
+        raise ValueError("write the backup outside the vault")
+    entries = [vault, *vault.rglob("*")]
+    for p in entries:
+        mode = p.lstat().st_mode
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise ValueError("vault contains a link or special file")
+    fd, tmp = tempfile.mkstemp(prefix=".ccswitch-backup-", dir=out.parent)
+    with os.fdopen(fd, "wb") as stream:
+        with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+            for p in entries:
+                archive.add(p, arcname=str(p.relative_to(vault.parent)), recursive=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, out)
+except (OSError, ValueError, tarfile.TarError) as e:
+    sys.exit("backup refused: " + str(e))
+finally:
+    if tmp and os.path.exists(tmp):
+        os.unlink(tmp)
+PYEOF
   info "backed up -> $out"
   warn "this archive contains live session tokens - store it somewhere encrypted"
 }
@@ -1128,20 +1153,104 @@ cmd_backup() {
 cmd_restore() {
   local f="${1:-}"; [ -n "$f" ] || die "usage: ccswitch restore <file.tar.gz>"
   [ -f "$f" ] || die "no such file: $f"
-  tar xzf "$f" -C "$(dirname "$VAULT")"
+  python3 - "$VAULT" "$f" <<'PYEOF'
+import json, os, pathlib, re, shutil, sys, tarfile, tempfile
+vault = pathlib.Path(os.path.abspath(sys.argv[1]))
+name = re.compile(r"[A-Za-z0-9._-]+\Z")
+def valid_name(value):
+    return value not in (".", "..", "") and name.fullmatch(value)
+try:
+    if vault.is_symlink():
+        raise ValueError("vault must not be a symlink")
+    # No extract()/extractall(): archive paths, modes and links are untrusted.
+    # Bound both expanded data and headers (including tar's extended headers).
+    import gzip
+    with gzip.open(sys.argv[2], "rb") as compressed:
+        total = 0
+        while True:
+            chunk = compressed.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 64 * 1024 * 1024:
+                raise ValueError("archive exceeds 64 MiB expanded limit")
+    files, seen, size = {}, set(), 0
+    with tarfile.open(sys.argv[2], "r:gz") as archive:
+        for member in archive:
+            raw = member.name.rstrip("/")
+            parts = raw.split("/")
+            if (len(seen) >= 4096 or raw in seen or parts[0] != vault.name
+                    or any(p in ("", ".", "..") for p in parts)):
+                raise ValueError("duplicate, excessive, or out-of-vault member")
+            seen.add(raw)
+            rel = parts[1:]
+            if member.isdir():
+                if rel and rel != ["accounts"] and not (
+                        len(rel) == 2 and rel[0] == "accounts" and valid_name(rel[1])):
+                    raise ValueError("unexpected directory")
+                continue
+            if not member.isfile():
+                raise ValueError("links and special files are forbidden")
+            allowed = (len(rel) == 1 and rel[0] in ("active", "mcp-oauth.json", ".latest-version")) or (
+                len(rel) == 3 and rel[0] == "accounts" and valid_name(rel[1]) and
+                rel[2] in ("credentials.json", "identity.json", "host", "mcp-isolated"))
+            size += member.size
+            if not allowed or member.size > 16 * 1024 * 1024 or size > 32 * 1024 * 1024:
+                raise ValueError("unexpected file or excessive data")
+            data = archive.extractfile(member).read()
+            if rel[-1].endswith(".json"):
+                value = json.loads(data)
+                if not isinstance(value, dict):
+                    raise ValueError("JSON files must contain objects")
+                if rel[-1] == "identity.json":
+                    value = {k: value[k] for k in ("oauthAccount", "userID") if k in value}
+                data = json.dumps(value, indent=2).encode()
+            if rel == ["active"] and not valid_name(data.decode().strip()):
+                raise ValueError("invalid active account")
+            if rel != [".latest-version"]:
+                files[tuple(rel)] = data
+    if vault.name not in seen and not files:
+        raise ValueError("empty archive")
+    active = files.get(("active",), b"").decode().strip()
+    if active and ("accounts", active, "credentials.json") not in files:
+        raise ValueError("active account has no credentials")
+    with tempfile.TemporaryDirectory(prefix=".ccswitch-restore-", dir=vault.parent) as tmp:
+        stage = pathlib.Path(tmp) / "new"
+        (stage / "accounts").mkdir(parents=True, mode=0o700)
+        for parts, data in files.items():
+            target = stage.joinpath(*parts)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with target.open("xb") as stream:
+                stream.write(data)
+            target.chmod(0o600)
+        # Never put the last original copy inside auto-cleaned staging.
+        recovery = pathlib.Path(tempfile.mkdtemp(prefix=".ccswitch-recovery-", dir=vault.parent))
+        old = recovery / vault.name
+        try:
+            os.rename(vault, old)
+            os.rename(stage, vault)
+        except BaseException:
+            if old.exists():
+                try:
+                    if vault.exists():
+                        raise OSError("vault path is occupied")
+                    os.rename(old, vault)
+                except BaseException:
+                    print("original vault preserved for recovery at " + str(old), file=sys.stderr)
+                else:
+                    recovery.rmdir()
+            else:
+                recovery.rmdir()
+            raise
+        shutil.rmtree(recovery)
+except (OSError, ValueError, UnicodeError, EOFError, tarfile.TarError) as e:
+    sys.exit("restore refused: " + str(e))
+PYEOF
   info "restored vault from $f"
   cmd_list
 }
 
-# --- self-update ------------------------------------------------------------
-REPO_SLUG="${CCSWITCH_REPO:-2hmad/ccswitch}"
-NPM_PKG="@2hmad/ccswitch"
-NPM_REGISTRY="${CCSWITCH_NPM_REGISTRY:-https://registry.npmjs.org}"
-UPDATE_CACHE="$VAULT/.latest-version"
-
-# The real path of this script, following the symlink a package manager leaves
-# in its bin directory - npm's global bin is a symlink farm, so the link name
-# alone says nothing about where the package actually lives.
+# Resolve the local executable for the optional autosync service.
 self_path() {
   local self
   self="$(command -v ccswitch 2>/dev/null || printf '%s' "$0")"
@@ -1149,150 +1258,6 @@ self_path() {
     printf '%s' "$self"
 }
 
-# Where this copy came from, so 'update' does not fight a package manager.
-install_method() {
-  local self; self="$(self_path)"
-  case "$self" in
-    *node_modules*)    printf 'npm' ;;
-    *Cellar*|*linuxbrew*|*homebrew*) printf 'brew' ;;
-    *)                 printf 'standalone' ;;
-  esac
-}
-
-fetch_url() {  # $1=url -> body on stdout, non-zero on failure
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 10 "$1"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout=10 "$1"
-  else
-    return 1
-  fi
-}
-
-# Latest version this copy can actually update to, without a leading v. An npm
-# copy asks the registry rather than GitHub: a tag whose npm publish failed is
-# a release npm users cannot install, so it must not be offered to them.
-latest_version() {
-  if [ "$(install_method)" = "npm" ]; then
-    fetch_url "$NPM_REGISTRY/$NPM_PKG/latest" 2>/dev/null |
-      python3 -c 'import json,sys
-try:
-    print(json.load(sys.stdin).get("version") or "")
-except Exception:
-    pass' 2>/dev/null
-    return
-  fi
-  fetch_url "https://api.github.com/repos/$REPO_SLUG/releases/latest" 2>/dev/null |
-    python3 -c 'import json,sys
-try:
-    print((json.load(sys.stdin).get("tag_name") or "").lstrip("v"))
-except Exception:
-    pass' 2>/dev/null
-}
-
-# Update an npm copy through npm itself, so npm's own record of the package
-# stays true. Pin the exact version that was checked, not @latest, so what is
-# installed is what was reported.
-npm_update_to() {  # $1=version
-  command -v npm >/dev/null 2>&1 || die "npm is not on PATH - update with:
-       npm install -g $NPM_PKG@$1"
-  # --prefer-online: the version was just read live from the registry, but
-  # npm resolves from its metadata cache, which right after a release does not
-  # know the new version yet and fails with ETARGET.
-  info "running: npm install -g --prefer-online $NPM_PKG@$1"
-  npm install -g --prefer-online "$NPM_PKG@$1" ||
-    die "npm install failed - if it needs more permissions, run it yourself:
-       npm install -g $NPM_PKG@$1"
-  info "${GRN}updated${RST} $VERSION -> ${B}$1${RST}"
-}
-
-# Numeric compare: 0 when $1 is newer than $2.
-version_gt() {
-  [ "$1" != "$2" ] || return 1
-  python3 - "$1" "$2" <<'PYEOF'
-import sys
-def parts(v):
-    out = []
-    for chunk in v.split("."):
-        num = "".join(c for c in chunk if c.isdigit())
-        out.append(int(num) if num else 0)
-    return out
-a, b = parts(sys.argv[1]), parts(sys.argv[2])
-n = max(len(a), len(b))
-a += [0] * (n - len(a)); b += [0] * (n - len(b))
-raise SystemExit(0 if a > b else 1)
-PYEOF
-}
-
-# Refresh the cached "latest version" note. Network, so only called from
-# commands where a short pause is acceptable - never from 'use' or 'list'.
-update_check() {
-  local v; v="$(latest_version)"
-  [ -n "$v" ] || return 1
-  mkdir -p "$VAULT"
-  printf '%s\n' "$v" > "$UPDATE_CACHE" 2>/dev/null || true
-  printf '%s' "$v"
-}
-
-# Offline: print a one-line notice if the cache says a newer version exists.
-update_notice() {
-  [ -z "${CCSWITCH_NO_UPDATE_NOTICE:-}" ] || return 0
-  [ -f "$UPDATE_CACHE" ] || return 0
-  local v; v="$(cat "$UPDATE_CACHE" 2>/dev/null)"
-  [ -n "$v" ] || return 0
-  if version_gt "$v" "$VERSION"; then
-    info "${DIM}ccswitch $v is available (you have $VERSION) - run: ccswitch update${RST}"
-  fi
-}
-
-cmd_update() {
-  local check_only="" method
-  [ "${1:-}" != "--check" ] || check_only=1
-  method="$(install_method)"
-
-  info "current: ${B}$VERSION${RST}"
-  local where="GitHub"; [ "$method" != "npm" ] || where="the npm registry"
-  local latest; latest="$(update_check)" ||
-    die "could not reach $where to check for updates"
-  info "latest:  ${B}$latest${RST}"
-
-  if ! version_gt "$latest" "$VERSION"; then
-    info "${GRN}already up to date${RST}"
-    return 0
-  fi
-  [ -z "$check_only" ] || { info "run 'ccswitch update' to install it"; return 0; }
-
-  case "$method" in
-    npm)  npm_update_to "$latest"; return 0 ;;
-    brew) die "this copy was installed with Homebrew - update it with:
-       brew upgrade ccswitch" ;;
-  esac
-
-  local self; self="$(self_path)"
-  [ -w "$(dirname "$self")" ] ||
-    die "$self is not writable - reinstall with your package manager, or:
-       curl -fsSL https://raw.githubusercontent.com/$REPO_SLUG/main/install.sh | bash"
-
-  local tmp; tmp="$(mktemp)"
-  fetch_url "https://raw.githubusercontent.com/$REPO_SLUG/v$latest/bin/ccswitch" > "$tmp" ||
-    { rm -f "$tmp"; die "download failed"; }
-
-  # Refuse anything that is not plausibly the script - a captive-portal HTML
-  # page or a truncated download must never land on top of a working install.
-  if ! head -1 "$tmp" | grep -q '^#!.*bash' ||
-     ! grep -q "^VERSION=\"$latest\"" "$tmp" ||
-     [ "$(wc -c < "$tmp")" -lt 4096 ]; then
-    rm -f "$tmp"
-    die "downloaded file does not look like ccswitch $latest - refusing to install it"
-  fi
-  bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; die "downloaded file has a syntax error - refusing to install it"; }
-
-  chmod 755 "$tmp"
-  # Rename rather than overwrite: bash reads a script incrementally, so writing
-  # into the running file's inode would corrupt this very process.
-  mv "$tmp" "$self" || { rm -f "$tmp"; die "could not replace $self"; }
-  info "${GRN}updated${RST} $VERSION -> $latest"
-}
 
 cmd_doctor() {
   local ok=0 _none=""
@@ -1350,7 +1315,7 @@ _ccswitch() {
   case "$prev" in
     use|rm|rename|login|refresh|save) COMPREPLY=($(compgen -W "$accounts" -- "$cur")); return;;
   esac
-  COMPREPLY=($(compgen -W "use add login list current rm rename mcp save sync autosync refresh backup restore doctor update completion help version" -- "$cur"))
+  COMPREPLY=($(compgen -W "use add login list current rm rename mcp save sync autosync refresh backup restore doctor completion help version" -- "$cur"))
 }
 complete -F _ccswitch ccswitch
 EOF
@@ -1360,7 +1325,7 @@ EOF
 _ccswitch() {
   local -a accounts cmds
   accounts=(${(f)"$(ls -1 ${CCSWITCH_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccswitch}/accounts 2>/dev/null)"})
-  cmds=(use add login list current rm rename mcp save sync autosync refresh backup restore doctor update completion help version)
+  cmds=(use add login list current rm rename mcp save sync autosync refresh backup restore doctor completion help version)
   if (( CURRENT == 2 )); then
     _describe 'command' cmds
     _describe 'account' accounts
@@ -1402,7 +1367,6 @@ ${B}USAGE${RST}
   ccswitch backup [file]         archive the vault
   ccswitch restore <file>        restore a vault archive
   ccswitch doctor                diagnose the setup
-  ccswitch update [--check]      update ccswitch itself to the latest release
   ccswitch completion <bash|zsh> print a shell completion script
 
 ${B}EXAMPLE${RST}
@@ -1418,8 +1382,6 @@ ${B}ENVIRONMENT${RST}
   CCSWITCH_REFRESH_WINDOW_DAYS
                    how close to the refresh token's expiry 'refresh' renews it
                    (default 7)
-  CCSWITCH_NO_UPDATE_NOTICE
-                   set to any value to silence the 'update available' line
   NO_COLOR         disable colour
 EOF
 }
@@ -1451,7 +1413,7 @@ case "$cmd" in
   restore)            cmd_restore "${1:-}" ;;
   doctor)             cmd_doctor ;;
   completion)         cmd_completion "${1:-}" ;;
-  update|upgrade)     cmd_update "${1:-}" ;;
+  update|upgrade)     die "updates are permanently disabled in this local fork; edit and reinstall the local source yourself" ;;
   version|-V|--version) info "ccswitch $VERSION" ;;
   help|-h|--help)     usage ;;
   "")                 cmd_list ;;

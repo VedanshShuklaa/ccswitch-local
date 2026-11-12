@@ -1,400 +1,98 @@
-# ccswitch
+# ccswitch-local
 
-Switch between multiple Claude Code accounts with one command — without re-running `/login` every time, and without splitting your setup into isolated copies.
+Personal, hardened fork of [2hmad/ccswitch](https://github.com/2hmad/ccswitch),
+based on upstream commit `d303f8f9b276dc700c41e5dfc58dbde5f4e15248`.
+Switch Claude Code accounts while sharing your existing configuration.
 
-```console
-$ ccswitch list
-  ACCOUNT      EMAIL                          STATUS               RELOGIN
-* work         you@example.com                ready                24d
-  personal     you@example.net                ready                19d
-  client       you@example.org                BROKEN - re-login    -
+## No software updates
 
-$ ccswitch personal
-switched to personal  (you@example.net)  valid 6h 40m
+There is **no updater, update check, registry lookup, or remote installer**.
+`ccswitch update`, `upgrade`, and `update --check` fail without network access.
+Environment variables cannot re-enable updates. This repository does not publish
+npm packages or automated releases. To change the tool, edit this local source,
+review and test it, then explicitly run `bash install.sh` again.
 
-$ claude          # runs as personal
-```
+`refresh` still renews account login tokens through your installed Claude Code;
+it does not download or update ccswitch. Claude Code itself may access the network
+and run its configured integrations. This fork does not control Claude's own updates.
 
-## Why
+## Local installation
 
-Claude Code stores one signed-in account at a time. The usual workaround is to give each account its own `CLAUDE_CONFIG_DIR`, but that isolates _everything_ — your MCP servers, plugins, skills, agents, slash commands, session history and `CLAUDE.md` all get duplicated per account, and each copy drifts.
-
-ccswitch takes the opposite approach. One `~/.claude`, shared by every account. Only the credential and the identity it belongs to are swapped.
-
-|                              | Separate `CLAUDE_CONFIG_DIR` | ccswitch |
-| ---------------------------- | ---------------------------- | -------- |
-| MCP servers                  | duplicated per account       | shared   |
-| Plugins & marketplaces       | duplicated per account       | shared   |
-| Skills, agents, commands     | duplicated per account       | shared   |
-| Session history              | duplicated per account       | shared   |
-| `settings.json`, `CLAUDE.md` | duplicated per account       | shared   |
-| Accounts active at once      | many                         | one      |
-
-That last row is the trade-off. If you need two accounts running _simultaneously_ in different terminals, use `CLAUDE_CONFIG_DIR` instead — ccswitch changes which account `claude` runs as, globally.
-
-## Install
+Requires Bash, Python 3, and an existing Claude Code installation.
 
 ```bash
-npm install -g @2hmad/ccswitch
+cd ~/projects/ccswitch-local
+bash install.sh
+ccswitch version
 ```
 
-Every release is published from CI with [npm provenance](https://docs.npmjs.com/generating-provenance-statements), so you can verify the package was built from this repository.
+Installs the reviewed local `bin/ccswitch` to `~/.local/bin/ccswitch`.
+The installer resolves its own source directory and never downloads a replacement.
+If needed, add `~/.local/bin` to your shell PATH.
 
-The npm package is scoped because the unscoped `ccswitch` name belongs to an unrelated project. The installed command is still `ccswitch`.
-
-<details>
-<summary>Without Node</summary>
+## Use
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/2hmad/ccswitch/main/install.sh | bash
+ccswitch add personal       # save the account already logged in
+ccswitch login work         # open Claude; /login, then /exit
+ccswitch list
+ccswitch personal
+claude
 ```
 
-Or from a checkout:
+Exit active Claude sessions before switching. Accounts share settings, MCP
+servers, plugins, history and project permissions; this is not account isolation.
+`ccswitch help` lists all supported commands. No login or token migration occurs
+merely by installing this fork.
+
+## Security changes
+
+- Private creation mask (`077`), private temporary backups, atomic backup publication.
+- Restores accept only known vault files and directories; reject links, special
+  files, duplicate paths, path traversal and malformed JSON before replacing data.
+- Restores stage privately and normalize directories to `700`, files to `600`.
+  Archive limits: 64 MiB expanded tar, 32 MiB file contents, 16 MiB per file,
+  4096 members. Legacy update cache is discarded.
+- Only `oauthAccount` and `userID` are applied from identity files. Restores cannot
+  inject MCP configuration through extra identity keys.
+- Account arguments reject traversal and symlinked account directories.
+- All software-update and remote-install code has been removed.
+
+## Backups
 
 ```bash
-git clone https://github.com/2hmad/ccswitch
-cd ccswitch && ./install.sh
+ccswitch backup /secure/location/accounts.tar.gz
+ccswitch restore /secure/location/accounts.tar.gz
 ```
 
-</details>
+Backups contain **unencrypted live Claude and MCP tokens**. Keep them private.
+Restore replaces the vault; use only your own trusted backups. It does not change
+which credentials Claude is currently using until you switch accounts. Stop
+concurrent ccswitch commands/autosync before restoring. The archive root must match
+your vault directory name (normally `ccswitch`).
+If a failed restore cannot roll back, it prints the private recovery directory
+containing the original vault. Keep that directory until you recover your accounts.
 
-Requires `bash`, `python3`, and Claude Code. Node is only a delivery mechanism — nothing at runtime uses it. Linux is supported; macOS is experimental — see [Platform support](#platform-support).
+The vault is normally `~/.config/ccswitch`. `CCSWITCH_HOME` overrides it;
+`CLAUDE_CONFIG_DIR` controls the live Claude directory. macOS uses the Keychain
+for the live credential, but the account vault and backups are still plaintext.
+Processes running as your OS user can read your tokens; this tool is not a sandbox.
 
-## Update
+## Verification
 
 ```bash
-ccswitch update            # install the latest release
-ccswitch update --check    # just report what is available
+python3 test/security.py
+bash test/smoke.sh
+bash test/keychain.sh
+bash -n bin/ccswitch
+bash -n install.sh
 ```
 
-`ccswitch update` knows how it was installed. An npm copy checks the npm registry and updates through npm itself, so `npm update -g @2hmad/ccswitch` works just as well. A curl copy checks GitHub and replaces itself: before replacing anything it checks the download is really ccswitch, of the expected version, and parses as valid bash, then swaps it in by rename so the running script is never written through.
+On Linux, run the shell suites with `PATH=/usr/bin:/bin` to exclude an installed
+Claude executable and avoid interference from real running Claude sessions.
 
-**Moving from the curl install to npm.** `npm update -g` only updates a package npm already has, so it does nothing for a curl-installed copy, and that copy in `~/.local/bin` usually sits ahead of npm's on `PATH`. Install with npm, remove the old copy, and re-point autosync at the new path:
+Tests use temporary paths and dummy credentials. The keychain suite uses a mock;
+it does not establish real macOS Keychain compatibility.
 
-```bash
-npm install -g @2hmad/ccswitch
-rm ~/.local/bin/ccswitch
-ccswitch autosync install          # if you use autosync
-ccswitch --version                 # confirm the npm copy is the one running
-```
-
-**Using nvm (or another Node version manager)?** Global packages belong to one Node version, and autosync records the full path to ccswitch. After switching or upgrading Node, reinstall and re-point it, or autosync silently stops capturing rotations:
-
-```bash
-npm install -g @2hmad/ccswitch && ccswitch autosync install
-```
-
-`ccswitch list` mentions a newer version when one exists. That line is printed from a cache written by the scheduled `refresh` run, so `list` itself never touches the network. Silence it with `CCSWITCH_NO_UPDATE_NOTICE=1`.
-
-## Uninstall
-
-```bash
-ccswitch autosync uninstall        # if you installed it
-npm uninstall -g @2hmad/ccswitch   # or: rm ~/.local/bin/ccswitch for a curl install
-```
-
-Also remove any cron job or timer you set up for `ccswitch refresh`. This removes the command only. Your stored accounts stay in `~/.config/ccswitch` — delete that too to remove them, and whichever account is signed in now stays signed in.
-
-## Usage
-
-Sign each account in once:
-
-```bash
-ccswitch login work        # opens Claude Code; run /login, then /exit
-ccswitch login personal
-ccswitch login client
-```
-
-Already signed in as one of them? Capture it without a fresh login:
-
-```bash
-ccswitch add work
-```
-
-Signed in with `/login` inside Claude Code instead? That changes the live account without telling ccswitch, so point it at the right slot afterwards:
-
-```bash
-ccswitch save work        # adopt the live credential into 'work'
-```
-
-A bare `ccswitch save` writes into the active account, and refuses if the live credential belongs to a different one — it names the account it actually belongs to.
-
-Then switch whenever you like:
-
-```bash
-ccswitch personal         # shorthand
-ccswitch use personal     # same thing
-claude                    # runs as personal
-```
-
-### All commands
-
-| Command                          | Description                                   |
-| -------------------------------- | --------------------------------------------- |
-| `ccswitch <name>`                | Switch to an account                          |
-| `ccswitch use <name> [--force]`  | Same, explicit form                           |
-| `ccswitch login <name>`          | Sign a new account in and store it            |
-| `ccswitch add <name>`            | Store the account you're already signed in as |
-| `ccswitch list`                  | Accounts, emails, token status                |
-| `ccswitch current`               | Print the active account name                 |
-| `ccswitch save [name]`           | Write the live token back to its account      |
-| `ccswitch sync`                  | Capture the live token into the account it belongs to |
-| `ccswitch autosync install`      | Capture every rotation automatically          |
-| `ccswitch refresh [name\|--all] [--force]` | Renew a token as its refresh token nears expiry |
-| `ccswitch rm <name>`             | Forget an account                             |
-| `ccswitch rename <old> <new>`    | Rename an account                             |
-| `ccswitch backup [file]`         | Archive the vault                             |
-| `ccswitch restore <file>`        | Restore a vault archive                       |
-| `ccswitch doctor`                | Diagnose the setup                            |
-| `ccswitch update [--check]`      | Update ccswitch itself                        |
-| `ccswitch completion bash\|zsh`  | Print a completion script                     |
-
-### Keeping parked accounts alive
-
-Claude Code holds two tokens: a short-lived access token (~8h) and a refresh token used to mint new ones. **The refresh token rotates** — every renewal consumes the old one and issues a replacement. Present a consumed token and the server answers `invalid_grant`, at which point Claude Code marks it dead and blanks the credential on disk, so the next thing you type asks you to sign in again.
-
-Each rotation also pushes the refresh token's expiry back out to roughly 28 days from that moment, so **an account you actually use never lapses**. The 28-day clock is not what costs you a login. Losing a rotation is. If the vault holds a snapshot taken before a rotation, restoring it hands the server a token that has already been spent.
-
-That is what `ccswitch autosync install` is for: a systemd path unit watches the credential file and captures every rotation as it is written, so the vault can never fall behind. Without it the vault only catches up when you happen to run a ccswitch command, which leaves a window.
-
-The access token expiring is a non-event — Claude Code renews it on use — so `ccswitch list` does not report it. `ccswitch doctor` shows it if you want the detail.
-
-That matters for a tool that snapshots and restores credentials. ccswitch keeps the vault in step by syncing the live credential into the active account's slot on **every** run, not only when you switch — a token Claude Code rotated mid-session, or a `/login` you typed inside Claude Code, would otherwise never reach the vault, and restoring that stale snapshot later would hand the server a consumed token. `ccswitch list` reports a slot whose tokens have been cleared as `BROKEN - re-login`, and its `RELOGIN` column counts down the refresh token's real remaining life.
-
-An account you haven't switched to in a few weeks can lose its refresh token, which forces a full `ccswitch login <name>` with a browser round-trip. `ccswitch refresh --all` prevents that: it restores each stored account in turn, makes one tiny API call to exercise its token, saves the renewed credential back, and returns you to the account you started on.
-
-Run it by hand whenever it occurs to you:
-
-```bash
-ccswitch refresh --all
-```
-
-Or schedule it daily. Because each renewal rotates the token, `refresh` does nothing until an account is within `CCSWITCH_REFRESH_WINDOW_DAYS` (default 7) of its refresh token expiring — so a typical run makes no API calls at all:
-
-```console
-$ ccswitch refresh --all
-skip    work  (you@example.com)  re-login in 24d - not due yet
-refreshed personal  (you@example.net)  valid 8h 0m
-```
-
-#### systemd user timer (recommended)
-
-Prefer this on anything that isn't a server running 24/7. `Persistent=true` catches up a run missed while the machine was off; **cron silently skips it**. A desktop that sleeps overnight will never fire a 4am cron job — the run is lost every night, without a single log line to say so. Pick a time the machine is usually awake anyway.
-
-`~/.config/systemd/user/ccswitch-refresh.service`:
-
-```ini
-[Unit]
-Description=Refresh parked ccswitch account tokens
-
-[Service]
-Type=oneshot
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%h/.local/bin/ccswitch refresh --all
-```
-
-`~/.config/systemd/user/ccswitch-refresh.timer`:
-
-```ini
-[Unit]
-Description=Daily ccswitch token refresh
-
-[Timer]
-OnCalendar=*-*-* 15:30:00
-Persistent=true
-RandomizedDelaySec=15m
-
-[Install]
-WantedBy=timers.target
-```
-
-Enable it:
-
-```bash
-systemctl --user daemon-reload
-systemctl --user enable --now ccswitch-refresh.timer
-
-systemctl --user list-timers ccswitch-refresh.timer   # when it next fires
-journalctl --user -u ccswitch-refresh.service         # what happened last time
-```
-
-If you want it to run while you're logged out, also `sudo loginctl enable-linger $USER`.
-
-#### cron
-
-Only if the machine is genuinely always on. `crontab -e`, then:
-
-```cron
-PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
-
-30 4 * * * ccswitch refresh --all >> "$HOME/.cache/ccswitch-refresh.log" 2>&1
-```
-
-Two things that trip people up:
-
-- **Set `PATH`.** cron runs with a bare `/usr/bin:/bin`, and `refresh` needs both `ccswitch` and the `claude` binary. Run `command -v claude` and put that directory first — it's usually `~/.local/bin`. Without this the job dies with `the 'claude' command was not found on PATH`.
-- **Pick an hour the machine is actually on, and you are not working.** `refresh` refuses to run while a `claude` process is alive. A job scheduled for a time you are always shut down never runs at all, and cron will not tell you.
-
-## How it works
-
-Claude Code keeps two pieces of account state:
-
-- `~/.claude/.credentials.json` — the OAuth access and refresh tokens
-- `~/.claude.json` — a mixed file holding your sign-in identity **and** your MCP servers, per-project trust decisions, and other config
-
-ccswitch stores per account, under `~/.config/ccswitch/accounts/<name>/`:
-
-```
-credentials.json   copy of .credentials.json
-identity.json      only the oauthAccount and userID keys from .claude.json
-mcp-isolated       present only for an account with its own MCP sign-ins
-```
-
-Switching writes those two back into place and leaves every other key in `~/.claude.json` untouched — which is why `mcpServers`, `projects` and the rest stay shared.
-
-The credential file also holds the OAuth tokens of your MCP servers (`mcpOAuth`). Those belong to your Figma, Sentry... sign-in, not to the Claude account, so they are kept once, in `~/.config/ccswitch/mcp-oauth.json`, and shared by every account: a switch swaps only the Claude login. Sign in or out of an MCP server under any account and every account sees it. Connectors added through claude.ai live on Anthropic's side and stay per account.
-
-If one account should sign in to a server as someone else — a client's Figma, say — isolate it. It then keeps its own MCP sign-ins in its slot, and the shared ones stay untouched for everyone else:
-
-```bash
-ccswitch mcp isolate client    # client signs in to MCP servers on its own
-ccswitch mcp share client      # back to the shared sign-ins
-ccswitch mcp                   # which accounts share, which are isolated
-```
-
-Before switching away, ccswitch saves the live credential back into the account you're leaving. Claude Code refreshes tokens during a session, so without this you'd restore a stale token the next time around.
-
-## Notes and caveats
-
-**One account is active at a time.** This is by design — it's the price of sharing everything. `ccswitch use` refuses to run while a `claude` process is detected; pass `--force` to override. A session left open keeps renewing its own account's token in the background; ccswitch files those renewals under the right account, but exit the session before switching back to it, or its newest token leaves with it.
-
-**The vault holds live session tokens.** `~/.config/ccswitch` is created mode 700 and files mode 600. `ccswitch backup` produces an archive containing those tokens — encrypt it if you keep it anywhere but your own disk.
-
-**Tokens rotate, and a lost rotation costs you a login.** Renewing consumes the old refresh token, so a snapshot taken before a rotation is worthless afterwards — the server answers `invalid_grant` and Claude Code blanks the credential on disk, which is why an account can suddenly demand `/login` mid-prompt. ccswitch syncs the live credential into the active slot on every run to stay ahead of this. An account it could not keep up with shows as `BROKEN - re-login` in `ccswitch list`, and needs one `ccswitch login <name>`.
-
-**Parked accounts still lapse.** The access token (~8h) refreshes itself whenever the _active_ account is used — Claude Code does that on its own. Accounts sitting in the vault aren't touched by anything, so their refresh token (~28 days) can expire outright. Run `ccswitch refresh --all` occasionally, or schedule it — see [Keeping parked accounts alive](#keeping-parked-accounts-alive). Because each renewal is itself a rotation, it acts only within `CCSWITCH_REFRESH_WINDOW_DAYS` (default 7) of the refresh token's expiry, so most runs make no API call at all. The `RELOGIN` column in `ccswitch list` is the number that matters.
-
-**`CLAUDE_CONFIG_DIR` takes priority.** If it's set, ccswitch operates on that directory instead of `~/.claude`. `ccswitch doctor` will warn you. If you're migrating from per-account config dirs, unset it first.
-
-**Project config is unaffected.** `.mcp.json`, `.claude/settings.json` and `CLAUDE.md` inside a repo load from the repo regardless of which account is active.
-
-## Migrating from per-account `CLAUDE_CONFIG_DIR`
-
-If you already have isolated config dirs, pick the one with the setup you want to keep, make it your `~/.claude`, then capture each account's credential:
-
-```bash
-unset CLAUDE_CONFIG_DIR                    # and remove it from ~/.zshrc
-
-# keep the best-configured directory as the shared one
-mv ~/.claude ~/.claude.old
-cp -r ~/.claude-accounts/work ~/.claude
-cp ~/.claude-accounts/work/.claude.json ~/.claude.json
-
-ccswitch add work                          # captures what's now live
-
-# for each remaining account, drop its credential in and capture it
-cp ~/.claude-accounts/personal/.credentials.json ~/.claude/.credentials.json
-python3 - <<'EOF'
-import json, os
-h = os.path.expanduser("~")
-src = json.load(open(f"{h}/.claude-accounts/personal/.claude.json"))
-dst = json.load(open(f"{h}/.claude.json"))
-for k in ("oauthAccount", "userID"):
-    dst[k] = src.get(k)
-json.dump(dst, open(f"{h}/.claude.json", "w"), indent=2)
-EOF
-ccswitch add personal
-```
-
-Then `ccswitch list` to confirm all of them are there.
-
-## Moving to another machine
-
-The vault is portable, but **an account cannot be live on two machines at once**. Refresh tokens rotate: whichever machine renews first invalidates the other's copy, and the loser gets a forced browser sign-in. So this is a move, not a copy — decide which machine owns the accounts.
-
-On the machine you are leaving:
-
-```bash
-ccswitch sync                              # capture the newest rotation first
-ccswitch backup ~/ccswitch-move.tar.gz     # the whole vault
-```
-
-`ccswitch sync` matters. The backup is only as fresh as the vault, and a rotation that has not been captured yet would be left behind — you would carry an already-spent token to the new machine.
-
-Copy it over a channel you trust, because it contains live session tokens:
-
-```bash
-scp ~/ccswitch-move.tar.gz you@laptop:~/
-```
-
-On the new machine:
-
-```bash
-npm install -g @2hmad/ccswitch     # or the curl installer
-ccswitch restore ~/ccswitch-move.tar.gz
-ccswitch autosync install
-ccswitch list                      # every account should read 'ready'
-shred -u ~/ccswitch-move.tar.gz    # it holds live tokens
-```
-
-Then on the old machine, stop using those accounts — `ccswitch rm <name>` for each, or delete `~/.config/ccswitch` outright. Leaving them behind is what causes the two machines to fight over rotations.
-
-### What the vault does not carry
-
-ccswitch stores only the credential and the identity it belongs to. Your MCP servers, plugins, skills, agents, commands, history and `CLAUDE.md` live in `~/.claude` and `~/.claude.json`, and are the same for every account — copy them separately if you want the same setup:
-
-```bash
-tar czf ~/claude-config.tar.gz -C ~ .claude .claude.json
-```
-
-Restore that **before** `ccswitch restore`, since it overwrites `~/.claude.json` — which is also where the active account's identity lives.
-
-### On WSL
-
-WSL behaves like Linux, and the file backend applies. One catch: `ccswitch autosync` and the scheduled refresh both need systemd, which WSL does not run as init unless you switch it on:
-
-```bash
-printf '[boot]\nsystemd=true\n' | sudo tee -a /etc/wsl.conf
-```
-
-Then `wsl --shutdown` from Windows and reopen. Without it, `ccswitch autosync install` will tell you so, and you can run `ccswitch sync` by hand after signing in instead.
-
-Keep everything inside the WSL filesystem (`~`), not under `/mnt/c`. Windows drives do not carry Unix permissions, so the vault could not be locked down to mode 700.
-
-## Platform support
-
-| Platform      | Status                                           |
-| ------------- | ------------------------------------------------ |
-| Linux         | Supported                                        |
-| macOS         | Experimental — works via the login keychain, but not yet confirmed on real hardware ([#1](https://github.com/2hmad/ccswitch/issues/1)) |
-| Windows / WSL | WSL behaves like Linux and should work; untested |
-
-On macOS, Claude Code keeps the OAuth credential in your login keychain rather than in `~/.claude/.credentials.json`, so ccswitch reads and writes it there with `security(1)`. It derives the same item Claude Code does:
-
-|         | Value                                                                                         |
-| ------- | --------------------------------------------------------------------------------------------- |
-| Service | `Claude Code-credentials`, plus `-<sha256(config dir)[:8]>` when `CLAUDE_CONFIG_DIR` is set   |
-| Account | `$USER`, or `claude-code-user` if that is unset or contains anything outside `[a-zA-Z0-9._-]` |
-
-This path has been exercised against a `security(1)` stand-in but not yet against a real Keychain, so treat it as experimental and report anything odd on [#1](https://github.com/2hmad/ccswitch/issues/1).
-
-`ccswitch doctor` prints what it resolved to. The first switch may raise a keychain prompt — macOS asks before letting a new binary read an item it did not create. Choose **Always Allow** if you would rather not be asked again.
-
-The keychain is the default on macOS, even if `~/.claude/.credentials.json` exists. Claude Code prefers Keychain, so letting a stale plaintext file select the backend can make ccswitch switch a different credential from the one Claude reads. The file is left untouched. If Claude Code is deliberately using plaintext storage because Keychain is unavailable, use `CCSWITCH_BACKEND=file`. You can also explicitly select `CCSWITCH_BACKEND=keychain`.
-
-Keychain values are written as compact ASCII JSON without a trailing newline.
-This matters because `security -w` returns hex instead of JSON when a stored
-value contains non-printable bytes. See Apple's
-[password output implementation](https://github.com/apple-oss-distributions/Security/blob/main/SecurityTool/macOS/keychain_find.c#L387).
-
-## Contributing
-
-Issues and pull requests welcome. Please run `shellcheck bin/ccswitch` before submitting; CI runs it on every push.
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md).
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT licensed; original copyright retained in LICENSE. Upstream history is retained
+in CHANGELOG.md; its old update/install instructions do not apply to this fork.
